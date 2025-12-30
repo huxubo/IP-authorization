@@ -7,49 +7,93 @@ class CloudflareRulesListClient
     private const API_BASE = 'https://api.cloudflare.com/client/v4';
 
     private HttpClient $httpClient;
-    private string $apiToken;
     private string $accountId;
     private ?string $listId;
     private ?string $listName;
+    
+    // Bearer token authentication
+    private ?string $apiToken = null;
+    
+    // X-Auth-Email + X-Auth-Key authentication
+    private ?string $authEmail = null;
+    private ?string $authKey = null;
+    
+    private string $authMethod;
 
     private ?array $itemsCache = null;
 
     public function __construct(
-        string $apiToken,
         string $accountId,
+        ?string $apiToken = null,
+        ?string $authEmail = null,
+        ?string $authKey = null,
         ?string $listId = null,
         ?string $listName = null,
         ?HttpClient $httpClient = null
     ) {
-        $this->apiToken = $apiToken;
         $this->accountId = $accountId;
         $this->listId = $listId;
         $this->listName = $listName;
         $this->httpClient = $httpClient ?? new HttpClient(15, 3);
+        
+        // Determine authentication method
+        if ($apiToken !== null) {
+            $this->apiToken = $apiToken;
+            $this->authMethod = 'bearer';
+        } elseif ($authEmail !== null && $authKey !== null) {
+            $this->authEmail = $authEmail;
+            $this->authKey = $authKey;
+            $this->authMethod = 'xauth';
+        } else {
+            throw new InvalidArgumentException('Either apiToken or both authEmail and authKey must be provided');
+        }
     }
 
     public static function fromEnv(?HttpClient $httpClient = null): ?self
     {
         $token = getenv('CLOUDFLARE_API_TOKEN') ?: '';
+        $authEmail = getenv('CLOUDFLARE_EMAIL') ?: '';
+        $authKey = getenv('CLOUDFLARE_API_KEY') ?: '';
         $accountId = getenv('CLOUDFLARE_ACCOUNT_ID') ?: '';
 
-        if ($token === '' || $accountId === '') {
+        if (empty($accountId)) {
             return null;
         }
 
-        $listId = getenv('CLOUDFLARE_LIST_ID') ?: null;
-        $listName = getenv('CLOUDFLARE_LIST_NAME') ?: null;
+        // Bearer token authentication (preferred)
+        if (!empty($token)) {
+            $listId = getenv('CLOUDFLARE_LIST_ID') ?: null;
+            $listName = getenv('CLOUDFLARE_LIST_NAME') ?: null;
 
-        return new self($token, $accountId, $listId, $listName, $httpClient);
+            return new self($accountId, $token, null, null, $listId, $listName, $httpClient);
+        }
+        
+        // X-Auth-Email + X-Auth-Key authentication
+        if (!empty($authEmail) && !empty($authKey)) {
+            $listId = getenv('CLOUDFLARE_LIST_ID') ?: null;
+            $listName = getenv('CLOUDFLARE_LIST_NAME') ?: null;
+
+            return new self($accountId, null, $authEmail, $authKey, $listId, $listName, $httpClient);
+        }
+
+        return null;
     }
 
     private function headers(): array
     {
-        return [
-            'Authorization: Bearer ' . $this->apiToken,
+        $headers = [
             'Content-Type: application/json',
             'Accept: application/json',
         ];
+        
+        if ($this->authMethod === 'bearer') {
+            $headers[] = 'Authorization: Bearer ' . $this->apiToken;
+        } elseif ($this->authMethod === 'xauth') {
+            $headers[] = 'X-Auth-Email: ' . $this->authEmail;
+            $headers[] = 'X-Auth-Key: ' . $this->authKey;
+        }
+        
+        return $headers;
     }
 
     private function buildUrl(string $path, array $query = []): string
