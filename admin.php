@@ -47,15 +47,7 @@ class IPAdminManager
 
     private function getSessionTimeout(): int
     {
-        $dbFile = $this->dbFile;
-        if (!file_exists($dbFile)) {
-            return 1800; // 默认30分钟
-        }
-        
-        $jsonContent = file_get_contents($dbFile);
-        $data = json_decode($jsonContent, true);
-        
-        return $data['settings']['session_timeout'] ?? 1800;
+        return $this->authService->getSessionTimeout();
     }
     
     private function authenticate($password)
@@ -132,17 +124,7 @@ class IPAdminManager
         }
         
         try {
-            if ($originalIp !== $newIp) {
-                // 先删除旧的，再添加新的
-                $this->authService->removeAllowedIp($originalIp);
-                $success = $this->authService->addAllowedIp($newIp, $description);
-            } else {
-                // 只更新描述
-                $success = $this->authService->updateIpEntry($originalIp, [
-                    'description' => $description
-                ]);
-            }
-            
+            $success = $this->authService->renameAllowedIp($originalIp, $newIp, $description);
             $this->jsonResponse($success, $success ? 'IP修改成功' : 'IP修改失败');
         } catch (Exception $e) {
             $this->jsonResponse(false, '修改失败：' . $e->getMessage());
@@ -158,8 +140,12 @@ class IPAdminManager
             return;
         }
         
-        $success = $this->authService->removeAllowedIp($ip);
-        $this->jsonResponse($success, $success ? 'IP删除成功' : 'IP不存在');
+        try {
+            $success = $this->authService->removeAllowedIp($ip);
+            $this->jsonResponse($success, $success ? 'IP删除成功' : 'IP不存在');
+        } catch (Exception $e) {
+            $this->jsonResponse(false, '删除失败：' . $e->getMessage());
+        }
     }
     
     private function handleChangePassword()

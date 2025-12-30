@@ -1,0 +1,16 @@
+# Database
+SQLite.db
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# PHP dependencies (if installed)
+/vendor/

@@ -136,6 +136,11 @@ class HttpClient implements HttpClientInterface
         return $this->request($url, 'OPTIONS', null, $headers);
     }
 
+    public function send(string $url, string $method, $data = null, array $headers = []): string
+    {
+        return $this->request($url, $method, $data, $headers);
+    }
+
     /**
      * 发送JSON格式的POST请求
      */
@@ -206,7 +211,7 @@ class HttpClient implements HttpClientInterface
         $options[CURLOPT_CUSTOMREQUEST] = $method;
         $options[CURLOPT_HTTPHEADER] = $this->prepareHeaders($headers);
         
-        if (in_array($method, ['POST', 'PUT', 'PATCH'])) {
+        if (in_array($method, ['POST', 'PUT', 'PATCH', 'DELETE'])) {
             if ($data !== null) {
                 $options[CURLOPT_POSTFIELDS] = $data;
             }
@@ -271,7 +276,7 @@ class HttpClient implements HttpClientInterface
         $options[CURLOPT_HEADER] = true;
         $options[CURLOPT_HTTPHEADER] = $this->prepareHeaders($headers);
         
-        if (in_array($method, ['POST', 'PUT', 'PATCH'])) {
+        if (in_array($method, ['POST', 'PUT', 'PATCH', 'DELETE'])) {
             if ($data !== null) {
                 $options[CURLOPT_POSTFIELDS] = $data;
             }
@@ -301,7 +306,7 @@ class HttpClient implements HttpClientInterface
         $options[CURLOPT_CUSTOMREQUEST] = $method;
         $options[CURLOPT_HTTPHEADER] = $this->prepareHeaders($headers);
         
-        if (in_array($method, ['POST', 'PUT', 'PATCH'])) {
+        if (in_array($method, ['POST', 'PUT', 'PATCH', 'DELETE'])) {
             if ($data !== null) {
                 $options[CURLOPT_POSTFIELDS] = $data;
             }
