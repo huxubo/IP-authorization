@@ -1,5 +1,7 @@
 <?php
 
+require_once __DIR__ . '/CloudflareRulesListClient.php';
+
 interface AuthInterface
 {
     public function isIpAllowed(string $ip): bool;
@@ -13,6 +15,7 @@ class AuthService implements AuthInterface
 {
     private PDO $pdo;
     private array $allowedIps = [];
+    private ?CloudflareRulesListClient $cloudflareClient = null;
 
     public function __construct(string $dbFile)
     {
@@ -27,6 +30,7 @@ class AuthService implements AuthInterface
         ]);
 
         $this->initSchema();
+        $this->cloudflareClient = CloudflareRulesListClient::fromEnv();
         $this->loadAllowedIps();
     }
 
@@ -91,34 +95,71 @@ class AuthService implements AuthInterface
 
         $now = date('Y-m-d H:i:s');
 
-        $stmt = $this->pdo->prepare("
-            INSERT INTO allowed_ips (ip, description, created_at, updated_at)
-            VALUES (:ip, :d, :c, :u)
-        ");
+        $this->pdo->beginTransaction();
 
-        $ok = $stmt->execute([
-            ':ip' => $ip,
-            ':d'  => $description,
-            ':c'  => $now,
-            ':u'  => $now
-        ]);
+        try {
+            $stmt = $this->pdo->prepare("
+                INSERT INTO allowed_ips (ip, description, created_at, updated_at)
+                VALUES (:ip, :d, :c, :u)
+            ");
 
-        if ($ok) {
+            $ok = $stmt->execute([
+                ':ip' => $ip,
+                ':d'  => $description,
+                ':c'  => $now,
+                ':u'  => $now
+            ]);
+
+            if (!$ok) {
+                $this->pdo->rollBack();
+                return false;
+            }
+
+            if ($this->cloudflareClient !== null) {
+                $this->cloudflareClient->upsertItem($ip, $description);
+            }
+
+            $this->pdo->commit();
             $this->loadAllowedIps();
+            return true;
+        } catch (Throwable $e) {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+            throw $e;
         }
-        return $ok;
     }
 
     public function removeAllowedIp(string $ip): bool
     {
-        $stmt = $this->pdo->prepare("DELETE FROM allowed_ips WHERE ip = :ip");
-        $stmt->execute([':ip' => $ip]);
+        if (!$this->ipEntryExists($ip)) {
+            return false;
+        }
 
-        if ($stmt->rowCount() > 0) {
+        $this->pdo->beginTransaction();
+
+        try {
+            $stmt = $this->pdo->prepare("DELETE FROM allowed_ips WHERE ip = :ip");
+            $stmt->execute([':ip' => $ip]);
+
+            if ($stmt->rowCount() === 0) {
+                $this->pdo->rollBack();
+                return false;
+            }
+
+            if ($this->cloudflareClient !== null) {
+                $this->cloudflareClient->deleteItemByIp($ip);
+            }
+
+            $this->pdo->commit();
             $this->loadAllowedIps();
             return true;
+        } catch (Throwable $e) {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+            throw $e;
         }
-        return false;
     }
 
     public function getAllowedIps(): array
@@ -134,28 +175,180 @@ class AuthService implements AuthInterface
 
     public function updateIpEntry(string $ip, array $data): bool
     {
-        // 必须传 description
         if (!array_key_exists('description', $data)) {
             return false;
         }
-    
-        $stmt = $this->pdo->prepare(
-            "UPDATE allowed_ips 
-             SET description = :description, updated_at = :updated_at 
-             WHERE ip = :ip"
-        );
-    
-        $result = $stmt->execute([
-            ':description' => $data['description'],
-            ':updated_at'  => date('Y-m-d H:i:s'),
-            ':ip'          => $ip
-        ]);
-        
-        if ($result && $stmt->rowCount() > 0) {
+
+        $this->pdo->beginTransaction();
+
+        try {
+            $stmt = $this->pdo->prepare(
+                "UPDATE allowed_ips 
+                 SET description = :description, updated_at = :updated_at 
+                 WHERE ip = :ip"
+            );
+
+            $result = $stmt->execute([
+                ':description' => $data['description'],
+                ':updated_at'  => date('Y-m-d H:i:s'),
+                ':ip'          => $ip
+            ]);
+
+            if (!$result || $stmt->rowCount() === 0) {
+                $this->pdo->rollBack();
+                return false;
+            }
+
+            if ($this->cloudflareClient !== null) {
+                $this->cloudflareClient->updateItemComment($ip, $data['description']);
+            }
+
+            $this->pdo->commit();
             $this->loadAllowedIps();
             return true;
+        } catch (Throwable $e) {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+            throw $e;
         }
-        return false;
+    }
+
+    public function renameAllowedIp(string $originalIp, string $newIp, string $description = ''): bool
+    {
+        if (!$this->validateIpFormat($newIp)) {
+            throw new InvalidArgumentException("Invalid IP format: {$newIp}");
+        }
+
+        if (!$this->ipEntryExists($originalIp)) {
+            return false;
+        }
+
+        if ($originalIp !== $newIp && $this->ipEntryExists($newIp)) {
+            return false;
+        }
+
+        $existing = null;
+        foreach ($this->allowedIps as $entry) {
+            if (($entry['ip'] ?? '') === $originalIp) {
+                $existing = $entry;
+                break;
+            }
+        }
+
+        $createdAt = $existing['created_at'] ?? date('Y-m-d H:i:s');
+        $updatedAt = date('Y-m-d H:i:s');
+        $newItemExisted = false;
+
+        if ($this->cloudflareClient !== null) {
+            $newItemExisted = $this->cloudflareClient->findItemByIp($newIp) !== null;
+
+            try {
+                $this->cloudflareClient->upsertItem($newIp, $description);
+                if ($originalIp !== $newIp) {
+                    $this->cloudflareClient->deleteItemByIp($originalIp);
+                }
+            } catch (Throwable $e) {
+                if ($originalIp !== $newIp && !$newItemExisted) {
+                    try {
+                        $this->cloudflareClient->deleteItemByIp($newIp);
+                    } catch (Throwable $ignored) {
+                    }
+                }
+
+                throw $e;
+            }
+        }
+
+        $this->pdo->beginTransaction();
+
+        try {
+            if ($originalIp === $newIp) {
+                $stmt = $this->pdo->prepare(
+                    "UPDATE allowed_ips 
+                     SET description = :description, updated_at = :updated_at 
+                     WHERE ip = :ip"
+                );
+
+                $ok = $stmt->execute([
+                    ':description' => $description,
+                    ':updated_at'  => $updatedAt,
+                    ':ip'          => $originalIp
+                ]);
+
+                if (!$ok || $stmt->rowCount() === 0) {
+                    $this->pdo->rollBack();
+                    return false;
+                }
+            } else {
+                $deleteStmt = $this->pdo->prepare("DELETE FROM allowed_ips WHERE ip = :ip");
+                $deleteStmt->execute([':ip' => $originalIp]);
+
+                if ($deleteStmt->rowCount() === 0) {
+                    $this->pdo->rollBack();
+
+                    if ($this->cloudflareClient !== null) {
+                        try {
+                            if (!$newItemExisted) {
+                                $this->cloudflareClient->deleteItemByIp($newIp);
+                            }
+                            $this->cloudflareClient->upsertItem($originalIp, $existing['description'] ?? '');
+                        } catch (Throwable $ignored) {
+                        }
+                    }
+
+                    return false;
+                }
+
+                $insertStmt = $this->pdo->prepare(
+                    "INSERT INTO allowed_ips (ip, description, created_at, updated_at)
+                     VALUES (:ip, :d, :c, :u)"
+                );
+
+                $ok = $insertStmt->execute([
+                    ':ip' => $newIp,
+                    ':d'  => $description,
+                    ':c'  => $createdAt,
+                    ':u'  => $updatedAt
+                ]);
+
+                if (!$ok) {
+                    $this->pdo->rollBack();
+
+                    if ($this->cloudflareClient !== null) {
+                        try {
+                            if (!$newItemExisted) {
+                                $this->cloudflareClient->deleteItemByIp($newIp);
+                            }
+                            $this->cloudflareClient->upsertItem($originalIp, $existing['description'] ?? '');
+                        } catch (Throwable $ignored) {
+                        }
+                    }
+
+                    return false;
+                }
+            }
+
+            $this->pdo->commit();
+            $this->loadAllowedIps();
+            return true;
+        } catch (Throwable $e) {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+
+            if ($this->cloudflareClient !== null && $originalIp !== $newIp) {
+                try {
+                    if (!$newItemExisted) {
+                        $this->cloudflareClient->deleteItemByIp($newIp);
+                    }
+                    $this->cloudflareClient->upsertItem($originalIp, $existing['description'] ?? '');
+                } catch (Throwable $rollbackError) {
+                }
+            }
+
+            throw $e;
+        }
     }
 
     private function loadAllowedIps(): void
@@ -164,8 +357,77 @@ class AuthService implements AuthInterface
             ->query("SELECT * FROM allowed_ips ORDER BY created_at ASC")
             ->fetchAll();
 
-        if (empty($this->allowedIps)) {
-            $this->initializeDefaultIps();
+        if (!empty($this->allowedIps)) {
+            return;
+        }
+
+        $this->initializeFromCloudflare();
+        $this->allowedIps = $this->pdo
+            ->query("SELECT * FROM allowed_ips ORDER BY created_at ASC")
+            ->fetchAll();
+
+        if (!empty($this->allowedIps)) {
+            return;
+        }
+
+        $this->initializeDefaultIps();
+        $this->allowedIps = $this->pdo
+            ->query("SELECT * FROM allowed_ips ORDER BY created_at ASC")
+            ->fetchAll();
+    }
+
+    private function insertAllowedIpRow(string $ip, string $description = '', ?string $createdAt = null, ?string $updatedAt = null): bool
+    {
+        if (!$this->validateIpFormat($ip)) {
+            return false;
+        }
+
+        $createdAt = $createdAt ?? date('Y-m-d H:i:s');
+        $updatedAt = $updatedAt ?? $createdAt;
+
+        $stmt = $this->pdo->prepare(
+            "INSERT OR IGNORE INTO allowed_ips (ip, description, created_at, updated_at)
+             VALUES (:ip, :d, :c, :u)"
+        );
+
+        return $stmt->execute([
+            ':ip' => $ip,
+            ':d'  => $description,
+            ':c'  => $createdAt,
+            ':u'  => $updatedAt,
+        ]);
+    }
+
+    private function initializeFromCloudflare(): void
+    {
+        if ($this->cloudflareClient === null) {
+            return;
+        }
+
+        try {
+            $items = $this->cloudflareClient->listItems(false);
+        } catch (Throwable $e) {
+            return;
+        }
+
+        if (empty($items) || !is_array($items)) {
+            return;
+        }
+
+        $now = date('Y-m-d H:i:s');
+
+        foreach ($items as $item) {
+            $ip = $item['ip'] ?? ($item['value'] ?? null);
+            if (!is_string($ip) || $ip === '') {
+                continue;
+            }
+
+            $comment = $item['comment'] ?? '';
+            if (!is_string($comment)) {
+                $comment = '';
+            }
+
+            $this->insertAllowedIpRow($ip, $comment, $now, $now);
         }
     }
 
@@ -177,7 +439,7 @@ class AuthService implements AuthInterface
         ];
 
         foreach ($defaults as [$ip, $desc]) {
-            $this->addAllowedIp($ip, $desc);
+            $this->insertAllowedIpRow($ip, $desc);
         }
     }
 
